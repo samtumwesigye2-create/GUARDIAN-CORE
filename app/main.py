@@ -1,17 +1,19 @@
 from __future__ import annotations
 import os, time
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 try:
     import psycopg
     from psycopg.rows import dict_row
 except Exception:
     psycopg = None
 
-app = FastAPI(title="UNG GUARDIAN", version="0.1.0")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SERVICE_TOKEN = os.environ.get("GUARDIAN_SERVICE_TOKEN", "")
+JANUS_BASE_URL = os.environ.get("JANUS_BASE_URL", "")
+PULSAR_BASE_URL = os.environ.get("PULSAR_BASE_URL", "")
 
 SCHEMA = """
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -51,15 +53,28 @@ def conn():
         raise HTTPException(503, "Database is not configured")
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
-@app.on_event("startup")
-def init_db():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     if DATABASE_URL and psycopg is not None:
         with psycopg.connect(DATABASE_URL) as c:
             c.execute(SCHEMA)
+    yield
+
+app = FastAPI(title="UNG GUARDIAN", version="0.2.0", lifespan=lifespan)
 
 @app.get('/health')
 def health():
-    return {"status":"ok","service":"guardian","version":"0.1.0"}
+    return {"status":"ok","service":"guardian","version":"0.2.0"}
+
+@app.get('/ready')
+def ready():
+    db_ready = bool(DATABASE_URL and psycopg is not None)
+    return {
+        "status":"ready" if db_ready else "degraded",
+        "database": db_ready,
+        "janus_configured": bool(JANUS_BASE_URL),
+        "pulsar_configured": bool(PULSAR_BASE_URL),
+    }
 
 class SystemIn(BaseModel):
     system_key:str; display_name:str; category:str; criticality:str='medium'; trust_level:str='standard'
@@ -75,7 +90,8 @@ def register_system(body:SystemIn, x_service_token:str=Header(default="")):
         return row
 
 class HeartbeatIn(BaseModel):
-    status:Literal['ok','degraded','error']='ok'; metrics:dict[str,Any]={}
+    status:Literal['ok','degraded','error']='ok'
+    metrics:dict[str,Any]=Field(default_factory=dict)
 
 @app.post('/systems/{system_key}/heartbeat')
 def heartbeat(system_key:str, body:HeartbeatIn, x_service_token:str=Header(default="")):
@@ -87,7 +103,8 @@ def heartbeat(system_key:str, body:HeartbeatIn, x_service_token:str=Header(defau
         return {"accepted":True,"system_key":system_key,"status":body.status,"received_at":time.time()}
 
 class FindingIn(BaseModel):
-    system_key:str; category:str; entity_type:str; entity_id:str|None=None; severity:str='medium'; summary:str; evidence:dict[str,Any]={}
+    system_key:str; category:str; entity_type:str; entity_id:str|None=None; severity:str='medium'; summary:str
+    evidence:dict[str,Any]=Field(default_factory=dict)
 
 @app.post('/findings')
 def finding(body:FindingIn, x_service_token:str=Header(default="")):
